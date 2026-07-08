@@ -1,98 +1,79 @@
 """
-did.py — Difference-in-Differences estimator.
-
-This is the quasi-experimental method used when you *can't* randomize
-(e.g. a feature rolled out by region, not by random assignment — exactly
-the structure of the "Tourism Recovery Asymmetry" analysis in my thesis,
-applied here to a generic product/regional panel instead of NUTS-2 regions).
-
-Google's 2026 experimentation rounds explicitly test DiD, geo-randomized
-trials, and synthetic control as alternatives to standard A/B testing —
-this module is that.
+Tests verify the statistical machinery actually recovers known ground-truth
+effects from simulated data — not just that the code runs without crashing.
 """
-from __future__ import annotations
-from dataclasses import dataclass
-import numpy as np
-import pandas as pd
-import statsmodels.api as sm
-import statsmodels.formula.api as smf
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.simulate import ExperimentConfig, simulate_experiment, simulate_panel_for_did
+from src.power import required_sample_size, minimum_detectable_effect
+from src.ab_test import run_from_dataframe, two_proportion_z_test, check_sample_ratio_mismatch
+from src.did import estimate_did
 
 
-@dataclass
-class DiDResult:
-    att: float                    # average treatment effect on the treated
-    std_error: float
-    p_value: float
-    ci_95_low: float
-    ci_95_high: float
-    n_obs: int
-    n_units: int
-    n_periods: int
-    model_summary: str
-
-    def summary(self) -> str:
-        sig = "significant" if self.p_value < 0.05 else "not significant"
-        return (
-            f"DiD estimate (ATT): {self.att:+.3f}  (SE={self.std_error:.3f})\n"
-            f"95% CI: [{self.ci_95_low:+.3f}, {self.ci_95_high:+.3f}]\n"
-            f"p = {self.p_value:.4f}  →  {sig} at alpha=0.05\n"
-            f"Panel: {self.n_units} units × {self.n_periods} periods "
-            f"({self.n_obs} observations)"
-        )
+def test_z_test_detects_known_lift():
+    """With a large sample and a real 3pp lift, the test should find significance."""
+    cfg = ExperimentConfig(n_control=20000, n_treatment=20000, baseline_conversion=0.10, true_lift=0.03, days=1)
+    df = simulate_experiment(cfg)
+    result = run_from_dataframe(df)
+    assert result.significant_at_05, "should detect a large, well-powered effect"
+    assert result.absolute_lift > 0.015, "recovered lift should be in the right ballpark"
 
 
-def estimate_did(df: pd.DataFrame, y_col: str = "y") -> DiDResult:
-    """
-    Two-way fixed effects DiD:
-
-        y_it = alpha_i + lambda_t + beta * (treated_i * post_t) + eps_it
-
-    alpha_i: unit fixed effects (absorbs any time-invariant unit differences)
-    lambda_t: time fixed effects (absorbs any shock common to all units)
-    beta: the DiD estimate — the causal effect of treatment on the treated,
-          under the parallel-trends assumption.
-
-    df must have columns: unit, period, treated_unit, post, y
-    """
-    data = df.copy()
-    data["interaction"] = data["treated_unit"] * data["post"]
-
-    # unit and period fixed effects via categorical dummies (standard DiD spec)
-    formula = f"{y_col} ~ interaction + C(unit) + C(period)"
-    model = smf.ols(formula, data=data).fit(
-        cov_type="cluster", cov_kwds={"groups": data["unit"]}
-    )  # cluster SEs at the unit level — standard practice, avoids overstating precision
-
-    beta = model.params["interaction"]
-    se = model.bse["interaction"]
-    p = model.pvalues["interaction"]
-    ci = model.conf_int().loc["interaction"]
-
-    return DiDResult(
-        att=float(beta),
-        std_error=float(se),
-        p_value=float(p),
-        ci_95_low=float(ci[0]),
-        ci_95_high=float(ci[1]),
-        n_obs=len(data),
-        n_units=data["unit"].nunique(),
-        n_periods=data["period"].nunique(),
-        model_summary=str(model.summary()),
-    )
+def test_z_test_no_false_positive_on_null():
+    """With zero true effect, most runs should NOT reject the null (sanity check on Type I error)."""
+    false_positives = 0
+    for seed in range(20):
+        cfg = ExperimentConfig(n_control=3000, n_treatment=3000, baseline_conversion=0.10, true_lift=0.0, days=1, seed=seed)
+        df = simulate_experiment(cfg)
+        result = run_from_dataframe(df)
+        if result.significant_at_05:
+            false_positives += 1
+    # at alpha=0.05 we expect ~5% false positive rate; allow generous margin for a 20-run sample
+    assert false_positives <= 4, f"too many false positives under the null: {false_positives}/20"
 
 
-def parallel_trends_check(df: pd.DataFrame, y_col: str = "y") -> pd.DataFrame:
-    """
-    Pre-treatment trend check — the key identifying assumption of DiD.
-    Returns average outcome by group and period, pre-treatment only,
-    so you can visually/numerically confirm treated and control units
-    were moving in parallel *before* treatment started.
-    """
-    pre = df[df.post == 0]
-    return (
-        pre.groupby(["period", "treated_unit"])[y_col]
-        .mean()
-        .reset_index()
-        .pivot(index="period", columns="treated_unit", values=y_col)
-        .rename(columns={0: "control_mean", 1: "treated_mean"})
-    )
+def test_sample_size_increases_for_smaller_effect():
+    n_large_effect = required_sample_size(0.10, 0.05)
+    n_small_effect = required_sample_size(0.10, 0.01)
+    assert n_small_effect > n_large_effect, "detecting a smaller effect requires more samples"
+
+
+def test_srm_detects_injected_mismatch():
+    cfg = ExperimentConfig(n_control=10000, n_treatment=10000, sample_ratio_mismatch=0.15, days=1)
+    df = simulate_experiment(cfg)
+    srm = check_sample_ratio_mismatch(df)
+    assert srm["srm_detected"], "a 15% injected mismatch should be caught"
+
+
+def test_srm_clean_when_balanced():
+    cfg = ExperimentConfig(n_control=10000, n_treatment=10000, days=1)
+    df = simulate_experiment(cfg)
+    srm = check_sample_ratio_mismatch(df)
+    assert not srm["srm_detected"], "a balanced 50/50 split should not trigger SRM"
+
+
+def test_did_recovers_known_treatment_effect():
+    panel = simulate_panel_for_did(n_units=60, n_periods=12, treated_from_period=6, true_effect=4.0, seed=1)
+    result = estimate_did(panel)
+    assert abs(result.att - 4.0) < 1.0, f"DiD estimate {result.att:.2f} too far from true effect 4.0"
+    assert result.p_value < 0.05, "a true effect of this size with this much data should be significant"
+
+
+def test_did_null_effect_not_significant():
+    panel = simulate_panel_for_did(n_units=60, n_periods=12, treated_from_period=6, true_effect=0.0, seed=2)
+    result = estimate_did(panel)
+    assert result.p_value > 0.05, "with zero true effect, DiD should not find significance"
+
+
+if __name__ == "__main__":
+    tests = [v for k, v in list(globals().items()) if k.startswith("test_")]
+    passed = 0
+    for t in tests:
+        try:
+            t()
+            print(f"PASS  {t.__name__}")
+            passed += 1
+        except AssertionError as e:
+            print(f"FAIL  {t.__name__}: {e}")
+    print(f"\n{passed}/{len(tests)} passed")

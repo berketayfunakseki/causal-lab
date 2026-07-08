@@ -1,90 +1,98 @@
 """
-api.py — FastAPI service wrapping the toolkit.
-Consistent with the rest of my stack (Jobscope, Regulatory RAG): every
-project ships as a real, runnable API — not just a notebook.
+did.py — Difference-in-Differences estimator.
+
+This is the quasi-experimental method used when you *can't* randomize
+(e.g. a feature rolled out by region, not by random assignment — exactly
+the structure of the "Tourism Recovery Asymmetry" analysis in my thesis,
+applied here to a generic product/regional panel instead of NUTS-2 regions).
+
+Google's 2026 experimentation rounds explicitly test DiD, geo-randomized
+trials, and synthetic control as alternatives to standard A/B testing —
+this module is that.
 """
 from __future__ import annotations
-from fastapi import FastAPI
-from pydantic import BaseModel, Field
-
-from .simulate import ExperimentConfig, simulate_experiment, simulate_panel_for_did
-from .power import required_sample_size, minimum_detectable_effect, estimate_test_duration_days
-from .ab_test import two_proportion_z_test, run_from_dataframe, check_sample_ratio_mismatch
-from .did import estimate_did
-
-app = FastAPI(
-    title="Causal Lab API",
-    description="A/B testing, power analysis, and difference-in-differences as a service.",
-    version="1.0.0",
-)
+from dataclasses import dataclass
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
 
 
-class PowerRequest(BaseModel):
-    baseline_rate: float = Field(..., gt=0, lt=1, example=0.12)
-    minimum_detectable_effect: float = Field(..., gt=0, lt=1, example=0.015)
-    alpha: float = 0.05
-    power: float = 0.8
-    daily_traffic_per_group: int | None = None
+@dataclass
+class DiDResult:
+    att: float                    # average treatment effect on the treated
+    std_error: float
+    p_value: float
+    ci_95_low: float
+    ci_95_high: float
+    n_obs: int
+    n_units: int
+    n_periods: int
+    model_summary: str
+
+    def summary(self) -> str:
+        sig = "significant" if self.p_value < 0.05 else "not significant"
+        return (
+            f"DiD estimate (ATT): {self.att:+.3f}  (SE={self.std_error:.3f})\n"
+            f"95% CI: [{self.ci_95_low:+.3f}, {self.ci_95_high:+.3f}]\n"
+            f"p = {self.p_value:.4f}  →  {sig} at alpha=0.05\n"
+            f"Panel: {self.n_units} units × {self.n_periods} periods "
+            f"({self.n_obs} observations)"
+        )
 
 
-class ZTestRequest(BaseModel):
-    control_conversions: int
-    control_n: int
-    treatment_conversions: int
-    treatment_n: int
-    alpha: float = 0.05
-
-
-@app.get("/")
-def root():
-    return {"service": "causal-lab", "status": "ok"}
-
-
-@app.post("/power/sample-size")
-def sample_size(req: PowerRequest):
-    n = required_sample_size(req.baseline_rate, req.minimum_detectable_effect, req.alpha, req.power)
-    resp = {"required_n_per_group": n, "required_n_total": n * 2}
-    if req.daily_traffic_per_group:
-        resp["estimated_duration_days"] = estimate_test_duration_days(n, req.daily_traffic_per_group)
-    return resp
-
-
-@app.post("/ab-test/z-test")
-def z_test(req: ZTestRequest):
-    result = two_proportion_z_test(
-        req.control_conversions, req.control_n, req.treatment_conversions, req.treatment_n, req.alpha
-    )
-    return result.__dict__
-
-
-@app.get("/ab-test/simulate-and-test")
-def simulate_and_test(
-    n_per_group: int = 5000,
-    baseline_rate: float = 0.12,
-    true_lift: float = 0.015,
-    novelty_decay_days: int | None = None,
-    sample_ratio_mismatch: float | None = None,
-):
+def estimate_did(df: pd.DataFrame, y_col: str = "y") -> DiDResult:
     """
-    End-to-end demo: simulate an experiment with a known ground-truth effect,
-    then recover it with the z-test — proves the statistical machinery works.
+    Two-way fixed effects DiD:
+
+        y_it = alpha_i + lambda_t + beta * (treated_i * post_t) + eps_it
+
+    alpha_i: unit fixed effects (absorbs any time-invariant unit differences)
+    lambda_t: time fixed effects (absorbs any shock common to all units)
+    beta: the DiD estimate — the causal effect of treatment on the treated,
+          under the parallel-trends assumption.
+
+    df must have columns: unit, period, treated_unit, post, y
     """
-    cfg = ExperimentConfig(
-        n_control=n_per_group, n_treatment=n_per_group,
-        baseline_conversion=baseline_rate, true_lift=true_lift,
-        novelty_decay_days=novelty_decay_days, sample_ratio_mismatch=sample_ratio_mismatch,
+    data = df.copy()
+    data["interaction"] = data["treated_unit"] * data["post"]
+
+    # unit and period fixed effects via categorical dummies (standard DiD spec)
+    formula = f"{y_col} ~ interaction + C(unit) + C(period)"
+    model = smf.ols(formula, data=data).fit(
+        cov_type="cluster", cov_kwds={"groups": data["unit"]}
+    )  # cluster SEs at the unit level — standard practice, avoids overstating precision
+
+    beta = model.params["interaction"]
+    se = model.bse["interaction"]
+    p = model.pvalues["interaction"]
+    ci = model.conf_int().loc["interaction"]
+
+    return DiDResult(
+        att=float(beta),
+        std_error=float(se),
+        p_value=float(p),
+        ci_95_low=float(ci[0]),
+        ci_95_high=float(ci[1]),
+        n_obs=len(data),
+        n_units=data["unit"].nunique(),
+        n_periods=data["period"].nunique(),
+        model_summary=str(model.summary()),
     )
-    df = simulate_experiment(cfg)
-    result = run_from_dataframe(df)
-    srm = check_sample_ratio_mismatch(df)
-    return {"ground_truth_lift": true_lift, "test_result": result.__dict__, "srm_check": srm}
 
 
-@app.get("/did/simulate-and-estimate")
-def did_simulate_and_estimate(
-    n_units: int = 40, n_periods: int = 12, treated_from_period: int = 6, true_effect: float = 3.5
-):
-    """Simulate a regional panel and recover the injected treatment effect via DiD."""
-    df = simulate_panel_for_did(n_units, n_periods, treated_from_period, true_effect)
-    result = estimate_did(df)
-    return {"ground_truth_effect": true_effect, "did_result": result.__dict__}
+def parallel_trends_check(df: pd.DataFrame, y_col: str = "y") -> pd.DataFrame:
+    """
+    Pre-treatment trend check — the key identifying assumption of DiD.
+    Returns average outcome by group and period, pre-treatment only,
+    so you can visually/numerically confirm treated and control units
+    were moving in parallel *before* treatment started.
+    """
+    pre = df[df.post == 0]
+    return (
+        pre.groupby(["period", "treated_unit"])[y_col]
+        .mean()
+        .reset_index()
+        .pivot(index="period", columns="treated_unit", values=y_col)
+        .rename(columns={0: "control_mean", 1: "treated_mean"})
+    )

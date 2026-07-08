@@ -1,94 +1,70 @@
 """
-simulate.py — generates synthetic A/B test data with realistic quirks:
-novelty effects, sample ratio mismatch, and configurable true effect size.
+power.py — sample size / statistical power calculations.
 
-This exists so the rest of the toolkit (power analysis, hypothesis testing,
-DiD) has something honest to run against — we know the ground-truth effect
-we injected, so we can verify our own statistical methods recover it.
+Answers the question every DS is asked before running a test:
+"How many users do I need to reliably detect this effect?"
 """
 from __future__ import annotations
-import numpy as np
-import pandas as pd
-from dataclasses import dataclass
+import math
+from scipy import stats
 
 
-@dataclass
-class ExperimentConfig:
-    n_control: int = 5000
-    n_treatment: int = 5000
-    baseline_conversion: float = 0.12       # control group true conversion rate
-    true_lift: float = 0.015                # absolute lift injected into treatment (e.g. +1.5pp)
-    novelty_decay_days: int | None = None    # if set, treatment effect decays over N days (novelty effect)
-    days: int = 14
-    sample_ratio_mismatch: float | None = None  # if set (e.g. 0.02), injects an SRM bug
-    seed: int = 42
-
-
-def simulate_experiment(cfg: ExperimentConfig = ExperimentConfig()) -> pd.DataFrame:
+def required_sample_size(
+    baseline_rate: float,
+    minimum_detectable_effect: float,
+    alpha: float = 0.05,
+    power: float = 0.8,
+) -> int:
     """
-    Returns a user-level DataFrame: user_id, variant, day, converted (0/1).
-    Ground truth: control converts at cfg.baseline_conversion; treatment converts
-    at baseline + true_lift (optionally decaying over time to simulate novelty effect).
+    Sample size per group for a two-proportion z-test.
+
+    baseline_rate: control group conversion rate (e.g. 0.12)
+    minimum_detectable_effect: smallest absolute lift worth detecting (e.g. 0.015 = 1.5pp)
+    alpha: significance level (Type I error rate)
+    power: desired statistical power (1 - Type II error rate)
     """
-    rng = np.random.default_rng(cfg.seed)
+    p1 = baseline_rate
+    p2 = baseline_rate + minimum_detectable_effect
+    p_bar = (p1 + p2) / 2
 
-    n_control, n_treatment = cfg.n_control, cfg.n_treatment
-    if cfg.sample_ratio_mismatch:
-        # simulate a real-world SRM bug: treatment group is under/over-assigned
-        n_treatment = int(n_treatment * (1 - cfg.sample_ratio_mismatch))
+    z_alpha = stats.norm.ppf(1 - alpha / 2)   # two-sided
+    z_beta = stats.norm.ppf(power)
 
-    rows = []
-    for day in range(cfg.days):
-        # decaying novelty effect: lift shrinks toward 0 as days increase
-        if cfg.novelty_decay_days:
-            decay = max(0.0, 1 - day / cfg.novelty_decay_days)
+    numerator = (z_alpha * math.sqrt(2 * p_bar * (1 - p_bar)) +
+                 z_beta * math.sqrt(p1 * (1 - p1) + p2 * (1 - p2))) ** 2
+    denominator = (p2 - p1) ** 2
+
+    n = numerator / denominator
+    return math.ceil(n)
+
+
+def minimum_detectable_effect(
+    baseline_rate: float,
+    n_per_group: int,
+    alpha: float = 0.05,
+    power: float = 0.8,
+) -> float:
+    """
+    Inverse problem: given a fixed sample size (e.g. limited traffic),
+    what's the smallest effect we could reliably detect?
+    Solved via binary search since there's no closed form.
+    """
+    lo, hi = 0.0001, 0.5
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        n_needed = required_sample_size(baseline_rate, mid, alpha, power)
+        if n_needed > n_per_group:
+            lo = mid   # need a bigger effect to detect with this sample size
         else:
-            decay = 1.0
-
-        daily_n_c = n_control // cfg.days
-        daily_n_t = n_treatment // cfg.days
-
-        control_conv = rng.binomial(1, cfg.baseline_conversion, daily_n_c)
-        treat_conv = rng.binomial(
-            1, min(0.999, cfg.baseline_conversion + cfg.true_lift * decay), daily_n_t
-        )
-
-        for i, c in enumerate(control_conv):
-            rows.append({"user_id": f"c_{day}_{i}", "variant": "control", "day": day, "converted": int(c)})
-        for i, t in enumerate(treat_conv):
-            rows.append({"user_id": f"t_{day}_{i}", "variant": "treatment", "day": day, "converted": int(t)})
-
-    return pd.DataFrame(rows)
+            hi = mid
+    return hi
 
 
-def simulate_panel_for_did(
-    n_units: int = 40,
-    n_periods: int = 12,
-    treated_from_period: int = 6,
-    true_effect: float = 3.5,
-    seed: int = 7,
-) -> pd.DataFrame:
-    """
-    Panel data for difference-in-differences: half the units are "treated"
-    starting at treated_from_period, the rest are controls throughout.
-    Mirrors the structure used in the NUTS-2 regional thesis analysis —
-    unit fixed effects + time fixed effects + a treatment*post interaction.
-    """
-    rng = np.random.default_rng(seed)
-    unit_fe = rng.normal(50, 8, n_units)          # unit-level baseline (region fixed effect)
-    time_fe = np.linspace(0, 5, n_periods)          # common time trend
-    treated_units = set(range(n_units // 2))         # first half = treated group
-
-    rows = []
-    for unit in range(n_units):
-        for t in range(n_periods):
-            is_treated_unit = unit in treated_units
-            is_post = t >= treated_from_period
-            treatment_effect = true_effect if (is_treated_unit and is_post) else 0.0
-            noise = rng.normal(0, 2.5)
-            y = unit_fe[unit] + time_fe[t] + treatment_effect + noise
-            rows.append({
-                "unit": unit, "period": t, "y": y,
-                "treated_unit": int(is_treated_unit), "post": int(is_post),
-            })
-    return pd.DataFrame(rows)
+def estimate_test_duration_days(
+    required_n_per_group: int,
+    daily_traffic_per_group: int,
+) -> int:
+    """How many days to reach the required sample size, given daily traffic."""
+    if daily_traffic_per_group <= 0:
+        raise ValueError("daily_traffic_per_group must be positive")
+    return math.ceil(required_n_per_group / daily_traffic_per_group)
