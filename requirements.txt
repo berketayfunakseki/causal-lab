@@ -1,0 +1,10 @@
+fastapi==0.115.0
+uvicorn==0.32.0
+pydantic==2.9.0
+streamlit==1.39.0
+numpy==2.1.0
+pandas==2.2.3
+scipy==1.14.1
+statsmodels==0.14.4
+matplotlib==3.9.2
+pytest==8.3.3
